@@ -635,6 +635,8 @@ cleanup_threads_(struct self *own, pthread_t ptid)
     if (own)
         own->guard += 2;
 
+    struct quack_node_s *fini = NULL;
+
     caslock_acquire(&threads_.lock);
     struct quack_node_s *item = quack_popall(&threads_.retired);
     struct quack_node_s *next = NULL;
@@ -646,13 +648,21 @@ cleanup_threads_(struct self *own, pthread_t ptid)
 
         if ((ptid != 0 && self->ptid == ptid) ||
             (ptid == 0 && thread_dead_(self))) {
-            self_fini_(self);
-            vatomic_inc(&threads_.dead);
+            item->next = fini;
+            fini       = item;
         } else {
             quack_push(&threads_.retired, item);
         }
     }
     caslock_release(&threads_.lock);
+
+    for (item = fini; item; item = next) {
+        next              = item->next;
+        struct self *self = container_of(item, struct self, retired_node);
+        self_fini_(self);
+        vatomic_inc(&threads_.dead);
+    }
+
     if (own)
         own->guard -= 2;
 }
