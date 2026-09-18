@@ -67,6 +67,13 @@ struct tls_dtor {
 void self_tls_set(struct metadata *self, uintptr_t key, void *ptr,
                   struct tls_dtor dtor);
 
+/* Mark the calling thread as internal.
+ *
+ * An internal thread still gets a self object, but its events are not
+ * republished on the CAPTURE chains. Intended for helper
+ * threads that must not be observed by capture modules.
+ */
+void self_set_internal(void);
 
 /* Helper macro that gets or creates a memory area with the size of the type
  * pointed by global_ptr.

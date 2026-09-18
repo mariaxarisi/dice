@@ -65,6 +65,7 @@ struct self {
      * suppression bump the counter in steps of 2. */
     int guard;
     bool retired;
+    bool internal;
 };
 
 /* tls_item is a memory object allocated in the thread-local storage (tls) */
@@ -76,6 +77,8 @@ struct tls_item {
 
 static void cleanup_threads_(struct self *own, pthread_t ptid);
 static struct self *get_self_(void);
+static void retire_self_(struct self *self);
+static inline struct self *get_or_create_self_(bool publish);
 
 #define SELF_TLS_CAP 1024
 
@@ -247,6 +250,15 @@ self_tls_(struct metadata *md, const void *global, size_t size)
     return ptr;
 }
 
+DICE_HIDE void
+self_set_internal_(void)
+{
+    struct self *self = get_or_create_self_(false);
+    if (self != NULL) {
+        self->internal = true;
+    }
+}
+
 DICE_WEAK thread_id
 self_id(struct metadata *md)
 {
@@ -290,6 +302,12 @@ self_md(void)
     return (struct metadata *)get_self_();
 }
 
+DICE_WEAK void
+self_set_internal(void)
+{
+    self_set_internal_();
+}
+
 // -----------------------------------------------------------------------------
 // thread cache using pthread_get/setspecific
 // -----------------------------------------------------------------------------
@@ -306,7 +324,12 @@ static struct {
 static void
 thread_cache_destruct_(void *arg)
 {
-    (void)arg;
+    struct self *self = (struct self *)arg;
+    /* An internal thread created with the real pthread_create never emits
+     * THREAD_EXIT, so it is never retired the normal way. Retire it here, as
+     * its TSD cache is being cleared, so get_self_() can still find it. */
+    if (self != NULL && self->internal && !self->retired)
+        retire_self_(self);
 }
 
 static void
@@ -395,11 +418,12 @@ create_self_()
         self = mempool_alloc(sizeof(struct self));
         tls_init_(self);
     }
-    self->guard   = 0;
-    self->id      = vatomic64_inc_get(&threads_.count);
-    self->ptid    = pthread_self();
-    self->osid    = thread_osid_();
-    self->retired = false;
+    self->guard    = 0;
+    self->id       = vatomic64_inc_get(&threads_.count);
+    self->ptid     = pthread_self();
+    self->osid     = thread_osid_();
+    self->retired  = false;
+    self->internal = false;
     return self;
 }
 
@@ -511,12 +535,14 @@ self_handle_before_(const chain_id chain, const type_id type, void *event,
     (void)chain;
     assert(self);
 
-    if (likely(self->guard++ == 0))
-        self_publish_(CAPTURE_BEFORE, type, event, self);
-    else
+    if (likely(self->guard++ == 0)) {
+        if (likely(!self->internal))
+            self_publish_(CAPTURE_BEFORE, type, event, self);
+    } else {
         log_debug(">>> [%" PRIu64 ":0x%" PRIx64 ":%" PRIu64 "] %s/%s: %d",
                   self_id(&self->md), (uint64_t)self->ptid, self->osid,
                   ps_chain_str(chain), ps_type_str(type), self->guard);
+    }
 
     assert(self->guard >= 0);
     return PS_STOP_CHAIN;
@@ -529,12 +555,14 @@ self_handle_after_(const chain_id chain, const type_id type, void *event,
     (void)chain;
     assert(self);
 
-    if (likely(self->guard == 1))
-        self_publish_(CAPTURE_AFTER, type, event, self);
-    else
+    if (likely(self->guard == 1)) {
+        if (likely(!self->internal))
+            self_publish_(CAPTURE_AFTER, type, event, self);
+    } else {
         log_debug("<<< [%" PRIu64 ":0x%" PRIx64 ":%" PRIu64 "] %s/%s: %d",
                   self_id(&self->md), (uint64_t)self->ptid, self->osid,
                   ps_chain_str(chain), ps_type_str(type), self->guard);
+    }
 
     self->guard--;
     assert(self->guard >= 0);
@@ -548,12 +576,14 @@ self_handle_event_(const chain_id chain, const type_id type, void *event,
     (void)chain;
     assert(self);
 
-    if (likely(self->guard == 0))
-        self_publish_(CAPTURE_EVENT, type, event, self);
-    else
+    if (likely(self->guard == 0)) {
+        if (likely(!self->internal))
+            self_publish_(CAPTURE_EVENT, type, event, self);
+    } else {
         log_debug("!!! [%" PRIu64 ":0x%" PRIx64 ":%" PRIu64 "] %s/%s: %d",
                   self_id(&self->md), (uint64_t)self->ptid, self->osid,
                   ps_chain_str(chain), ps_type_str(type), self->guard);
+    }
 
     assert(self->guard >= 0);
     return PS_STOP_CHAIN;
@@ -659,8 +689,11 @@ cleanup_threads_(struct self *own, pthread_t ptid)
     for (item = fini; item; item = next) {
         next              = item->next;
         struct self *self = container_of(item, struct self, retired_node);
+        bool was_internal = self->internal;
         self_fini_(self);
-        vatomic_inc(&threads_.dead);
+        if (!was_internal) {
+            vatomic_inc(&threads_.dead);
+        }
     }
 
     if (own)
